@@ -1,0 +1,74 @@
+#include "../include/os_types.h"
+#include "../include/os_dispatcher.h"
+
+#define REG_X0  0
+#define REG_X1  1
+#define REG_X2  2
+#define REG_X8  8 
+
+#define SYS_IPC_SEND    1
+#define SYS_IPC_RECEIVE 2
+
+extern char _el0_text_start[];
+extern char _el0_text_end[];
+extern char _el0_stack_guard[];
+extern char _el0_stack_bottom[];
+extern char _el0_stack_top[];
+
+extern void uart_print(const char *str);
+
+int is_valid_el0_pointer(uint64_t ptr, uint64_t size) {
+    if (size > 0 && ptr + size < ptr) return 0; /* BLOCKER-20: Overflow Guard */
+
+    uint64_t stack_bottom = (uint64_t)_el0_stack_bottom;
+    uint64_t stack_top    = (uint64_t)_el0_stack_top;
+    uint64_t text_start   = (uint64_t)_el0_text_start;
+    uint64_t text_end     = (uint64_t)_el0_text_end;
+
+    if (ptr >= stack_bottom && (ptr + size) <= stack_top) return 1;
+    if (ptr >= text_start   && (ptr + size) <= text_end)  return 1;
+    return 0; 
+}
+
+void syscall_handler(uint64_t *regs) {
+    uint64_t esr;
+    __asm__ volatile("mrs %0, esr_el1" : "=r"(esr));
+    
+    uint32_t ec = (esr >> 26) & 0x3F;
+
+    if (ec == 0x15) { 
+        uint64_t syscall_num = regs[REG_X8];
+        
+        switch (syscall_num) {
+            case SYS_IPC_SEND:
+            {
+                uint32_t target_id = regs[REG_X0];
+                os_message_t *msg = (os_message_t*)regs[REG_X1];
+
+                if (!is_valid_el0_pointer((uint64_t)msg, sizeof(os_message_t))) {
+                    regs[REG_X0] = IPC_ERR_INVALID;
+                    break;
+                }
+                regs[REG_X0] = ipc_send(SYS_MOD_SHELL, msg);
+                break;
+            }
+            case SYS_IPC_RECEIVE:
+            {
+                os_message_t *msg = (os_message_t*)regs[REG_X0];
+
+                if (!is_valid_el0_pointer((uint64_t)msg, sizeof(os_message_t))) {
+                    regs[REG_X0] = IPC_ERR_INVALID;
+                    break;
+                }
+                regs[REG_X0] = ipc_receive(SYS_MOD_SHELL, msg);
+                break;
+            }
+            default:
+                regs[REG_X0] = IPC_ERR_DENIED;
+                break;
+        }
+    } else {
+        uart_print("FATAL: EL0 Synchronous Exception (Not SVC)\n");
+        while(1);
+    }
+}

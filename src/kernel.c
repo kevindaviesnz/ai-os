@@ -1,0 +1,85 @@
+#include "../include/os_types.h"
+#include "../include/os_loader.h"
+#include "../include/os_dispatcher.h"
+
+extern void mmu_init_tables(void);
+extern void gic_init(void);
+extern void timer_init(void);
+extern void dispatcher_init(void);
+extern void kpanic(const char *msg);
+extern void dispatch_pending_messages(void);
+
+extern uint32_t loaded_module_count;
+extern module_region_t module_regions[8];
+extern uint32_t system_ticks;
+
+
+void irq_handler(uint64_t *regs) {
+    (void)regs;
+    volatile uint32_t *gicc = (volatile uint32_t *)0x08010000;
+    uint32_t iar = gicc[3];
+    uint32_t irq = iar & 0x3FF;
+
+    if (irq == 30) { 
+        system_ticks++;
+        uint64_t cntpct;
+        __asm__ volatile("mrs %0, cntpct_el0" : "=r"(cntpct));
+        __asm__ volatile("msr cntp_tval_el0, %0" :: "r"(625000)); 
+        
+        if (system_ticks % 100 == 0) {
+            os_message_t msg;
+            msg.target_id = SYS_MOD_SHELL;
+            msg.type = IPC_TYPE_SYS_ACK; 
+            msg.length = 0;
+            ipc_send(0, &msg); 
+        }
+    } else if (irq == 33) { 
+        volatile uint32_t *uart = (volatile uint32_t *)0x09000000;
+        uint8_t c = (uint8_t)(*uart);
+        
+        os_message_t msg;
+        msg.target_id = SYS_MOD_SHELL;
+        msg.type = IPC_TYPE_CHAR_IN;
+        msg.length = 1;
+        msg.payload[0] = c;
+        ipc_send(0, &msg); 
+    }
+
+    gicc[4] = iar; 
+}
+
+void kernel_idle(void) {
+    while (1) {
+        dispatch_pending_messages();
+        __asm__ volatile("wfi");
+    }
+}
+
+/* THE FIX: A dedicated bootstrap that guarantees an EL0 transition */
+void boot_first_cartridge(uint64_t elr, uint64_t sp_el0) {
+    __asm__ volatile(
+        "msr elr_el1, %0\n\t"
+        "msr sp_el0, %1\n\t"
+        "msr spsr_el1, xzr\n\t" /* xzr (0) forces EL0 User Space */
+        "eret\n\t"
+        :: "r"(elr), "r"(sp_el0)
+    );
+    __builtin_unreachable();
+}
+
+void kernel_main(void) {
+    mmu_init_tables();
+    __asm__ volatile("msr sctlr_el1, %0" :: "r"(1 | (1 << 2) | (1 << 12))); 
+
+    gic_init();
+    timer_init();
+    dispatcher_init();
+    loader_init(); 
+
+    if (loaded_module_count > 0) {
+        boot_first_cartridge(module_regions[0].code_base, 
+                             module_regions[0].stack_base + module_regions[0].stack_size);
+    } else {
+        kpanic("FATAL: No cartridges loaded.\n");
+    }
+}

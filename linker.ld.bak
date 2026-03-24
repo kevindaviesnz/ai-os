@@ -42,8 +42,6 @@ SECTIONS
         _ttb_l3_uart = .;   . += 4096;
         _ttb_l3_gic = .;    . += 4096;
         _ttb_l3_kernel = .; . += 4096;
-        _ttb_l3_pool = .;   . += (4096 * 8); /* Dynamic L3 table pool */
-
         
         _bss_end = .;
     } > RAM

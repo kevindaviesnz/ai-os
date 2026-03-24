@@ -1,0 +1,96 @@
+#include "../include/os_loader.h"
+
+extern void uart_print(const char *str);
+extern void mmu_map_module_region(uint64_t code_base, uint64_t code_size, uint64_t stack_base, uint64_t stack_size);
+extern int cartridge_verify(const uint8_t *cartridge, uint32_t size, const uint8_t *pub_key);
+extern void launch_cartridge(uint64_t elr, uint64_t sp_el0);
+
+static module_region_t module_regions;
+static uint32_t loaded_module_count = 0;
+static uint64_t bump_ptr = MODULE_ALLOC_BASE;
+
+/* Basic memory copy for our bare-metal environment */
+void *memcpy(void *dest, const void *src, uint64_t n) {
+    uint8_t *d = dest;
+    const uint8_t *s = src;
+    while (n--) *d++ = *s++;
+    return dest;
+}
+
+/* BLOCKER-22: Bounded Bump Allocator */
+uint64_t module_alloc(uint64_t size) {
+    size = (size + 4095) & ~4095; /* Page align up */
+    if (bump_ptr + size > MODULE_ALLOC_LIMIT) {
+        return 0; /* Out of memory/bounds */
+    }
+    uint64_t addr = bump_ptr;
+    bump_ptr += size;
+    return addr;
+}
+
+module_region_t* get_region_for_current_module(void) {
+    uint64_t elr;
+    __asm__ volatile("mrs %0, elr_el1" : "=r"(elr));
+    
+    for (uint32_t i = 0; i < loaded_module_count; i++) {
+        if (elr >= module_regions[i].code_base &&
+            elr <  module_regions[i].code_base + module_regions[i].code_size) {
+            return &module_regions[i];
+        }
+    }
+    return (module_region_t*)0;
+}
+
+void loader_init(void) {
+    uart_print("[LOADER] Parsing ATKB Bundle...\n");
+    bundle_header_t *bundle = (bundle_header_t *)BUNDLE_PHYS_ADDR;
+
+    if (bundle->magic != MAGIC_ATKB) {
+        uart_print("FATAL: Invalid Bundle Magic!\n");
+        return;
+    }
+
+    for (uint32_t i = 0; i < bundle->cartridge_count && i < 8; i++) {
+        uint32_t offset = bundle->index[i].offset;
+        uint32_t size = bundle->index[i].size;
+        
+        cartridge_header_t *cart = (cartridge_header_t *)((uint8_t*)bundle + offset);
+
+        if (cart->magic != MAGIC_ATKM) {
+            uart_print("ERR: Invalid Cartridge Magic! Skipping.\n");
+            continue;
+        }
+
+        if (cartridge_verify((uint8_t*)cart, size, 0) < 0) {
+            uart_print("ERR: Cartridge Signature Failed! Skipping.\n");
+            continue;
+        }
+
+        uint64_t code_base = module_alloc(cart->code_size);
+        /* Add 4096 bytes for the unmapped guard page below the stack */
+        uint64_t stack_alloc = module_alloc(cart->stack_size + 4096);
+        
+        if (!code_base || !stack_alloc) {
+            uart_print("ERR: Out of memory mapping cartridge!\n");
+            continue;
+        }
+        
+        uint64_t stack_base = stack_alloc + 4096; /* Base is after guard page */
+
+        /* Copy the raw code payload (skipping the header) to our secure memory */
+        uint8_t *payload_src = (uint8_t*)cart + sizeof(cartridge_header_t);
+        memcpy((void*)code_base, payload_src, cart->code_size);
+
+        /* Map it securely in the MMU */
+        mmu_map_module_region(code_base, cart->code_size, stack_base, cart->stack_size);
+
+        /* Register it in our internal tracking table */
+        module_regions[loaded_module_count].module_id = cart->module_id;
+        module_regions[loaded_module_count].code_base = code_base;
+        module_regions[loaded_module_count].code_size = cart->code_size;
+        module_regions[loaded_module_count].stack_base = stack_base;
+        module_regions[loaded_module_count].stack_size = cart->stack_size;
+        loaded_module_count++;
+    }
+    uart_print("[LOADER] Bundle load complete.\n");
+}
