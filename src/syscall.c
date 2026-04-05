@@ -4,13 +4,14 @@
 
 #define REG_X0  0
 #define REG_X1  1
-#define REG_X8  8 
+#define REG_X8  8
 
 #define SYS_IPC_SEND         1
 #define SYS_IPC_RECEIVE      2
 #define SYS_MODULE_REGISTER  3
 #define SYS_INIT_DONE        4
 #define SYS_HANDLER_DONE     5
+#define SYS_UART_WRITE       6
 
 extern void kpanic(const char *str);
 extern void kernel_idle(void);
@@ -37,7 +38,7 @@ int is_valid_el0_pointer(uint64_t ptr, uint64_t size) {
     if (!reg) return 0;
     if (ptr >= reg->stack_base && (ptr + size) <= (reg->stack_base + reg->stack_size)) return 1;
     if (ptr >= reg->code_base && (ptr + size) <= (reg->code_base + reg->code_size)) return 1;
-    return 0; 
+    return 0;
 }
 
 const uint8_t capability_matrix[MODULE_COUNT][MODULE_COUNT] = {
@@ -50,21 +51,21 @@ const uint8_t capability_matrix[MODULE_COUNT][MODULE_COUNT] = {
 
 int ipc_send(uint32_t sender_id, const os_message_t *msg) {
     uint32_t target_id = msg->target_id;
-    if (sender_id >= MODULE_COUNT || target_id >= MODULE_COUNT) return IPC_ERR_INVALID; 
+    if (sender_id >= MODULE_COUNT || target_id >= MODULE_COUNT) return IPC_ERR_INVALID;
     if (!capability_matrix[sender_id][target_id]) return IPC_ERR_DENIED;
-    
+
     if (module_contexts[target_id].in_handler || module_contexts[target_id].has_msg) return IPC_ERR_INVALID;
-    
+
     module_contexts[target_id].mailbox.target_id = msg->target_id;
     module_contexts[target_id].mailbox.type = msg->type;
     module_contexts[target_id].mailbox.length = msg->length;
-    
-    for(int i=0; i<IPC_PAYLOAD_MAX_SIZE; i++) {
+
+    for (int i = 0; i < IPC_PAYLOAD_MAX_SIZE; i++) {
         module_contexts[target_id].mailbox.payload[i] = msg->payload[i];
     }
-    
+
     module_contexts[target_id].has_msg = 1;
-    return 0; 
+    return 0;
 }
 
 void dispatch_pending_messages(void) {
@@ -73,24 +74,23 @@ void dispatch_pending_messages(void) {
         if (module_contexts[i].initialized && module_contexts[i].has_msg && !module_contexts[i].in_handler) {
             module_contexts[i].has_msg = 0;
             module_contexts[i].in_handler = 1;
-            
+
             uint64_t elr = module_contexts[i].handler_ptr;
-            
+
             uint64_t sp_el0 = module_contexts[i].sp_el0;
             sp_el0 -= sizeof(os_message_t);
-            sp_el0 &= ~0xFULL; 
-            
+            sp_el0 &= ~0xFULL;
+
             os_message_t *dest = (os_message_t *)sp_el0;
             dest->target_id = module_contexts[i].mailbox.target_id;
             dest->type = module_contexts[i].mailbox.type;
             dest->length = module_contexts[i].mailbox.length;
-            
-            /* THE KERNEL FIX: Copy all 16 payload bytes to User Space, not just 4! */
-            for(int p=0; p<IPC_PAYLOAD_MAX_SIZE; p++) {
+
+            for (int p = 0; p < IPC_PAYLOAD_MAX_SIZE; p++) {
                 dest->payload[p] = module_contexts[i].mailbox.payload[p];
             }
-            
-            uint64_t arg = sp_el0; 
+
+            uint64_t arg = sp_el0;
             uint64_t stack_top = (uint64_t)_stack_top;
 
             __asm__ volatile(
@@ -122,11 +122,11 @@ void syscall_handler(uint64_t *regs) {
     __asm__ volatile("mrs %0, esr_el1" : "=r"(esr));
     uint32_t ec = (esr >> 26) & 0x3F;
 
-    if (ec == 0x15) { 
+    if (ec == 0x15) {
         uint64_t syscall_num = regs[REG_X8];
         module_region_t *reg = get_region_for_current_module();
         if (!reg) { kpanic("FATAL: SVC from unknown region\n"); }
-        
+
         uint32_t current_id = reg->module_id;
         if (current_id >= 8) { kpanic("FATAL: module_id out of bounds\n"); }
 
@@ -144,20 +144,20 @@ void syscall_handler(uint64_t *regs) {
                 module_contexts[current_id].sp_el0 = reg->stack_base + reg->stack_size;
 
                 uint32_t current_index = 0;
-                for(uint32_t i=0; i<loaded_module_count; i++) {
+                for (uint32_t i = 0; i < loaded_module_count; i++) {
                     if (module_regions[i].module_id == current_id) { current_index = i; break; }
                 }
 
                 uint32_t next_index = current_index + 1;
                 if (next_index < loaded_module_count) {
-                    regs[32] = module_regions[next_index].code_base; 
-                    regs[33] = 0; 
-                    regs[34] = module_regions[next_index].stack_base + module_regions[next_index].stack_size; 
+                    regs[32] = module_regions[next_index].code_base;
+                    regs[33] = 0;
+                    regs[34] = module_regions[next_index].stack_base + module_regions[next_index].stack_size;
                 } else {
                     regs[32] = (uint64_t)kernel_idle;
-                    regs[33] = 0x05; 
+                    regs[33] = 0x05;
                 }
-                regs[REG_X0] = 0; 
+                regs[REG_X0] = 0;
                 break;
             }
             case SYS_HANDLER_DONE:
@@ -170,11 +170,22 @@ void syscall_handler(uint64_t *regs) {
             }
             case SYS_IPC_SEND:
             {
-                os_message_t *msg = (os_message_t*)regs[REG_X1];
+                os_message_t *msg = (os_message_t *)regs[REG_X1];
                 if (!is_valid_el0_pointer((uint64_t)msg, sizeof(os_message_t))) {
                     regs[REG_X0] = 2; break;
                 }
                 regs[REG_X0] = ipc_send(current_id, msg);
+                break;
+            }
+            case SYS_UART_WRITE:
+            {
+                const char *str = (const char *)regs[REG_X0];
+                uint64_t len = regs[REG_X1];
+                volatile uint32_t *uart = (volatile uint32_t *)0x09000000;
+                for (uint64_t i = 0; i < len && str[i]; i++) {
+                    *uart = (uint32_t)str[i];
+                }
+                regs[REG_X0] = 0;
                 break;
             }
             default: regs[REG_X0] = 2; break;
